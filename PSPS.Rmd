@@ -734,7 +734,7 @@ procedure_codes <- c(61623, 61645, 37215, 61650, 61651)
 
 procedure_codes <- c(61624, 75894)
 procedure_codes <- c(61623, 61624, 61710)
-procedure_codes <- c(61630, 61635)
+procedure_codes <- c(61630, 61635) #
 
 df %>%
   
