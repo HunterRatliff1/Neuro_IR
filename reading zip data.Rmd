@@ -1,0 +1,247 @@
+---
+title: "Reading zipped data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(zip)
+```
+
+# Call the Physician and Other Supplier
+
+Sources can be found from here: https://www.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Medicare-Provider-Charge-Data/Physician-and-Other-Supplier
+
+This has data for the years
+
+- 2017
+- 2016
+- 2015
+- 2014
+- 2013
+- 2012
+
+Note that when you click the download link, in the browser you need to extract the exact URL. E.g. on [this page](https://www.cms.gov/apps/ama/license.asp?file=http://download.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Medicare-Provider-Charge-Data/Downloads/Medicare_Provider_Util_Payment_PUF_CY2017.zip), look in the URL to find the address of the actual file:
+
+> http://download.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Medicare-Provider-Charge-Data/Downloads/Medicare_Provider_Util_Payment_PUF_CY2017.zip
+
+## For year 2017
+
+```{r get2017, eval=F}
+url <- "http://download.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Medicare-Provider-Charge-Data/Downloads/Medicare_Provider_Util_Payment_PUF_CY2017.zip"
+
+file_name <- "Medicare_Provider_Util_Payment_PUF_CY2017.txt"
+
+
+
+
+temp <- tempfile()
+download.file(url, temp) # download to temp
+file_uz <- unz(temp, file_name)
+data <- readr::read_delim(file_uz, "\t", escape_double=F, trim_ws=T)
+unlink(temp)
+  
+# zip::unzip(temp, list=T)
+rm(url, file_name, file_uz, temp)
+
+data %>% write_csv("data/PUP_2017.csv")
+```
+
+```{r writeMerged17}
+data <- read_csv("data/PUP_2017.csv")
+# Interventional Radiology
+# Neurosurgery
+# Vascular Surgery
+
+IR <- data %>%
+  filter(provider_type=="Interventional Radiology") %>%
+  group_by(hcpcs_code, hcpcs_description, npi) %>%
+  summarise(line_srvc_cnt = sum(line_srvc_cnt)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(line_srvc_cnt = sum(line_srvc_cnt),
+            NPIs          = n())
+
+NSG <- data %>%
+  filter(provider_type=="Neurosurgery") %>%
+  group_by(hcpcs_code, hcpcs_description, npi) %>%
+  summarise(line_srvc_cnt = sum(line_srvc_cnt)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(line_srvc_cnt = sum(line_srvc_cnt),
+            NPIs          = n())
+
+
+Vasc <- data %>%
+  filter(provider_type=="Vascular Surgery") %>%
+  group_by(hcpcs_code, hcpcs_description, npi) %>%
+  summarise(line_srvc_cnt = sum(line_srvc_cnt)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(line_srvc_cnt = sum(line_srvc_cnt),
+            NPIs          = n())
+  
+merged <- bind_rows(
+  mutate(IR,   ProvType = "IR"),
+  mutate(NSG,  ProvType = "NSG"),
+  mutate(Vasc, ProvType = "Vasc")
+) %>%
+  mutate(Year = 2017)
+
+merged %>% write_csv("~/Neuro_IR/data/merged17.csv")
+rm(data)
+```
+
+```{r}
+merged %>%
+  filter(hcpcs_code %in% IR$hcpcs_code,
+         hcpcs_code %in% NSG$hcpcs_code,
+         ProvType != "Vasc") %>%
+  select(-NPIs) %>%
+  spread(ProvType, line_srvc_cnt) %>%
+  mutate(PctNSG = NSG/(NSG+IR)) %>%
+  arrange(PctNSG)
+  # arrange(hcpcs_code, ProvType) %>%
+  # View()
+```
+
+
+## For year 2016
+
+```{r get2016, eval=F}
+url <- "https://downloads.cms.gov/files/Medicare-Physician-and-Other-Supplier-PUF.zip"
+temp <- tempfile()
+download.file(url, temp) # download to temp
+
+# Find the name of the file
+zip::zip_list(temp)
+file_name <- "Medicare_Provider_Util_Payment_PUF_CY2016.txt"
+
+
+# Load as dataset
+file_uz <- unz(temp, file_name)
+data <- readr::read_delim(file_uz, "\t", escape_double=F, trim_ws=T)
+
+
+# write to csv
+data %>% 
+  filter(NPI!="0000000001") %>%
+  write_csv("data/PUP_2016.csv")
+
+
+# clean up
+unlink(temp)
+rm(url, file_name, file_uz, temp)
+
+```
+
+```{r writeMerged16}
+data <- read_csv("data/PUP_2016.csv")
+
+IR <- data %>%
+  filter(PROVIDER_TYPE=="Interventional Radiology") %>%
+  group_by(HCPCS_CODE, HCPCS_DESCRIPTION, NPI) %>%
+  summarise(LINE_SRVC_CNT = sum(LINE_SRVC_CNT)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(LINE_SRVC_CNT = sum(LINE_SRVC_CNT),
+            NPIs          = n())
+
+NSG <- data %>%
+  filter(PROVIDER_TYPE=="Neurosurgery") %>%
+  group_by(HCPCS_CODE, HCPCS_DESCRIPTION, NPI) %>%
+  summarise(LINE_SRVC_CNT = sum(LINE_SRVC_CNT)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(LINE_SRVC_CNT = sum(LINE_SRVC_CNT),
+            NPIs          = n())
+
+
+Vasc <- data %>%
+  filter(PROVIDER_TYPE=="Vascular Surgery") %>%
+  group_by(HCPCS_CODE, HCPCS_DESCRIPTION, NPI) %>%
+  summarise(LINE_SRVC_CNT = sum(LINE_SRVC_CNT)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(LINE_SRVC_CNT = sum(LINE_SRVC_CNT),
+            NPIs          = n())
+  
+merged <- bind_rows(
+  mutate(IR,   ProvType = "IR"),
+  mutate(NSG,  ProvType = "NSG"),
+  mutate(Vasc, ProvType = "Vasc")
+) %>%
+  mutate(Year = 2016)
+
+merged %>% write_csv("~/Neuro_IR/data/merged16.csv")
+rm(data)
+```
+
+## For year 2015
+
+```{r get2015, eval=F}
+url <- "http://download.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Medicare-Provider-Charge-Data/Downloads/Medicare_Provider_Util_Payment_PUF_CY2015.zip"
+temp <- tempfile()
+download.file(url, temp) # download to temp
+
+# Find the name of the file
+zip::zip_list(temp)
+file_name <- "Medicare_Provider_Util_Payment_PUF_CY2015.txt"
+
+
+# Load as dataset
+file_uz <- unz(temp, file_name)
+data <- readr::read_delim(file_uz, "\t", escape_double=F, trim_ws=T)
+
+
+# write to csv
+data %>% 
+  filter(npi!="0000000001") %>%
+  write_csv("data/PUP_2015.csv")
+
+
+# clean up
+unlink(temp)
+rm(url, file_name, file_uz, temp)
+
+```
+
+```{r writeMerged15, eval=F}
+data <- read_csv("data/PUP_2015.csv")
+
+IR <- data %>%
+  filter(provider_type=="Interventional Radiology") %>%
+  group_by(hcpcs_code, hcpcs_description, npi) %>%
+  summarise(line_srvc_cnt = sum(line_srvc_cnt)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(line_srvc_cnt = sum(line_srvc_cnt),
+            NPIs          = n())
+
+NSG <- data %>%
+  filter(provider_type=="Neurosurgery") %>%
+  group_by(hcpcs_code, hcpcs_description, npi) %>%
+  summarise(line_srvc_cnt = sum(line_srvc_cnt)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(line_srvc_cnt = sum(line_srvc_cnt),
+            NPIs          = n())
+
+
+Vasc <- data %>%
+  filter(provider_type=="Vascular Surgery") %>%
+  group_by(hcpcs_code, hcpcs_description, npi) %>%
+  summarise(line_srvc_cnt = sum(line_srvc_cnt)) %>%  # sum of hcpcs_code & provider
+  
+  summarise(line_srvc_cnt = sum(line_srvc_cnt),
+            NPIs          = n())
+  
+merged <- bind_rows(
+  mutate(IR,   ProvType = "IR"),
+  mutate(NSG,  ProvType = "NSG"),
+  mutate(Vasc, ProvType = "Vasc")
+) %>%
+  mutate(Year = 2015)
+
+merged %>% write_csv("~/Neuro_IR/data/merged15.csv")
+rm(data)
+```
+
+
+# Full NPI dataset
+
+Data source: http://download.cms.gov/nppes/NPI_Files.html
+
+Documentation can be found on this server under the `Full NPI documentation` folder

@@ -1,0 +1,754 @@
+---
+title: "Physician/Supplier Procedure Summary"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(glue)
+library(zip)
+library(parallel)
+library(furrr)   # parallel version of purrr
+library(googlesheets4)
+```
+
+
+
+
+# PSPS Overview
+
+Source for all this data is [here](https://www.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Physician-Supplier-Procedure-Summary)
+
+- **HCPCS_CD:**  Health Care Common Procedure Coding System code. Level I codes match CPT-4 codes
+- **PROVIDER_SPEC_CD:** Codes that CMS assigns to each provider. Details are found [here](https://www.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/MedicareFeeforSvcPartsAB/downloads/SpecialtyCodes2207.pdf), but for our purposes:
+    - `14` = Neurosurgery
+    - `13` = Neurology
+    - `77` = Vascular Surgery 
+    - `94` = Interventional Radiology 
+**PSPS_SUBMITTED_SERVICE_CNT:** The count of the total number of submitted services
+**PSPS_SUBMITTED_CHARGE_AMT:** The amount of charges submitted by the provider to Medicare
+**PSPS_ALLOWED_CHARGE_AMT:** The amount that is approved (allowed) for Medicare
+**HCPCS_BETOS_CD:** This field is valid beginning with 2003 data. The Berenson-Eggers Type of Service (BETOS) for the procedure code based on generally agreed upon clinically meaningful groupings of procedures and services
+
+## CPT codes
+
+These files don't give us any descriptions for the hcpcs codes, but we can try to pair it with cpt code descriptions. Unfortunatly the detailed CPT code info is owned by the AMA, but I was able to find some info from [this New York website](https://www.emedny.org/ProviderManuals/Physician/index.aspx)
+
+
+```{r call_CPT, eval=FALSE}
+## Source:  https://www.emedny.org/ProviderManuals/Physician/index.aspx
+url <- "https://www.emedny.org/ProviderManuals/Physician/PDFS/Physician_Manual_Fee_Schedule_Sect5.xls"
+destfile <- "Physician_Manual_Fee_Schedule_Sect5.xls"
+curl::curl_download(url, destfile)
+CPT <- readxl::read_excel(destfile, skip = 2)
+write_csv(CPT, "~/Neuro_IR/hcpcs_cpt_codes/CPT_NY.csv")
+
+# temp <- tempfile()
+# download.file("https://www.cms.gov/Medicare/Coding/HCPCSReleaseCodeSets/Downloads/2018-Alpha-Numeric-HCPCS-File.zip", temp) # download to temp
+# 
+# # Find the name of the file, and unzip it
+# zip::zip_list(temp)
+# zip::unzip(temp, "HCPC2018_CONTR_ANWEB_disc.xlsx", 
+#            exdir="~/Neuro_IR/hcpcs_cpt_codes/")
+# 
+# 
+# unlink(temp)
+# rm(temp)
+```
+
+```{r read_CPT}
+CPT <- read_csv("~/Neuro_IR/hcpcs_cpt_codes/CPT_NY.csv") %>%
+  select(CODE, description=DESCRIPTION)
+```
+
+Other less helpful CPT resources can be found [here](https://www.cms.gov/medicare-coverage-database/downloads/downloadable-databases.aspx), and the codebook for this specific csv is located in the `hcpcs_cpt_codes` folder. If you need additional crosswalks, check out [this post](https://www.reddit.com/r/datasets/comments/9sk4tt/cpthcpcs_codeset/) or this [website](https://hcpcs.codes/section/) for level II hcpcs codes.
+
+## Get Google Sheets
+
+Call GoogleSheet to get select codes from the [Google Sheet](https://docs.google.com/spreadsheets/d/1IR2TCwYZ-BX3MaVfZVh8vA1DZGRu965MDxzNXB1avqc/)
+
+```{r get_GS}
+library(googlesheets4)
+library(gargle)
+options(gargle_oob_default = TRUE) # required on RStudio Server
+
+gs <- as_sheets_id("https://docs.google.com/spreadsheets/d/1IR2TCwYZ-BX3MaVfZVh8vA1DZGRu965MDxzNXB1avqc/") %>%
+  read_sheet("NeuroIR codes")
+```
+
+## Merged dataset
+
+In the section below I create `psps-data/merged.csv`, but since I already saved it as a CSV we'll just read it here
+
+```{r read_merged}
+df <- read_csv("psps-data/merged.csv") %>% 
+  # Only select level 1
+  mutate(HCPCS_CD = as.numeric(HCPCS_CD)) %>%
+  filter(!is.na(HCPCS_CD)) %>%
+  rename(CPT=HCPCS_CD) %>%
+  # Join to description of 2019 codes
+  left_join(CPT, by=c("CPT"="CODE"))
+```
+
+
+
+# Downloading data
+
+Source: https://www.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Physician-Supplier-Procedure-Summary
+
+I made a tibble of the URLs, so that they can be called easily in the chunks below
+
+```{r urls}
+urls_df <- tibble(
+  url = c("http://download.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Physician-Supplier-Procedure-Summary/PSPS_2018.zip",
+          "http://download.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Physician-Supplier-Procedure-Summary/psps_2017.zip",
+          "https://downloads.cms.gov/files/PSPS2016.zip",
+          "https://downloads.cms.gov/files/PSPS2015.zip",
+          "https://downloads.cms.gov/files/PSPS2014.zip",
+          "https://downloads.cms.gov/files/PSPS2013.zip",
+          "https://downloads.cms.gov/files/PSPS2012.zip",
+          "https://downloads.cms.gov/files/PSPS2011.zip",
+          "https://downloads.cms.gov/files/PSPS2010.zip"),
+  years = c("2018", "2017", "2016", "2015", "2014", "2013", "2012", "2011", "2010")
+)
+```
+
+## Custom functions
+
+Things were going great downloading the data for the years 2018 and 2017. But from 2010 to 2016 the structure of the zip files changed, and there are 25 individual files. To make matters worse, they're no longer CSV's but instead are fixed width files (like the `.dat` files that SAS would read before they become `.sas7bdat` files).
+
+Even worse, the readr package [can't read zipfiles](https://stackoverflow.com/questions/38685650/read-fwf-not-working-while-unzipping-files) without having them each written to a directory, so I had to use read.fwf() for each file. The only good news is that all of these files follow the same structure, so I made the wrapper functions below:
+
+```{r read_fixed-fxn}
+# Reads a single fixed width file
+read_fixed <- function(file_name, tmpFile=NULL, widths=NULL, col.names=NULL, col.class=NULL, buffer=90000, readr=F){
+  # file_names: Name of file to read
+  # tmpFile:    If tmpFile is NOT provided, assume that file_name is the actual path to
+  #             the file. Otherwise, uses zip::unz() to unzip the file `file_name` from
+  #             the temporary location provided by temp
+  # widths:     Passed to read.fwf function if not null. Otherwise, defined in function
+  # col.names:  Passed to read.fwf function if not null. Otherwise, defined in function
+  # col.class:  Passed to read.fwf function if not null. Otherwise, defined in function
+  #
+  # Sadly, readr's read_fwf won't work with zip files unless they're fully unzipped
+  ## https://stackoverflow.com/questions/38685650/read-fwf-not-working-while-unzipping-files
+  library(tictoc)
+  tic(file_name)
+  
+  
+  # if not explicitly passed, define these in the script
+  if(is.null(widths))     widths    <- c(5,2,2,5,2,1,2,2,14,13,13,14,13,14,13,1,2,3)
+  if(is.null(col.class))  col.class <- c("character", "character", "character", "numeric", "character", "character",
+                                         "numeric", "character", "numeric", "numeric", "numeric", "numeric", "numeric",
+                                         "numeric", "numeric", "character", "numeric", "character")
+  if(is.null(col.names))  col.names <- c("HCPCS_CD", "HCPCS_INITIAL_MODIFIER_CD", "PROVIDER_SPEC_CD", "CARRIER_NUM", 
+                                         "PRICING_LOCALITY_CD", "TYPE_OF_SERVICE_CD", "PLACE_OF_SERVICE_CD", 
+                                         "HCPCS_SECOND_MODIFIER_CD", "PSPS_SUBMITTED_SERVICE_CNT","PSPS_SUBMITTED_CHARGE_AMT",
+                                         "PSPS_ALLOWED_CHARGE_AMT", "PSPS_DENIED_SERVICES_CNT", "PSPS_DENIED_CHARGE_AMT", 
+                                         "PSPS_ASSIGNED_SERVICES_CNT", "PSPS_NCH_PAYMENT_AMT", "PSPS_HCPCS_ASC_IND_CD", 
+                                         "PSPS_ERROR_IND_CD", "HCPCS_BETOS_CD")
+  
+  # if temp file given, read that instead
+  file_path <- file_name
+  if(!is.null(tmpFile)) file_path <- unz(tmpFile, file_name)
+  
+  # use try() since these files are error prone
+  if(readr) {
+    # use col_types that readr uses
+    col.class <- col.class %>% 
+      str_replace("numeric", "d") %>% 
+      str_replace("character", "c") %>%
+      str_c(collapse = "")
+    
+    df <- try(read_fwf(file_path, fwf_widths(widths, col_names=col.names),
+                       col_types=col.class))
+  } else({
+    df <- try(read.fwf(file_path, 
+                       widths = widths, col.names = col.names, colClasses=col.class,
+                       buffersize = buffer,
+                       stringsAsFactors=F))
+  })
+  
+  toc()
+  return(df)
+}
+```
+
+This first function `read_fixed` is actually a much better function than the one below, but I didn't make it until later in the project. It handles errors better and uses parallel so it's quicker
+
+
+```{r multi_uz-fxn}
+# this function can handle vectors itself and runs a for loop
+multi_uz <- function(file_names, tmpFile, widths=NULL, col.names=NULL, col.class=NULL) {
+  # file_names: Vector of filenames to look up
+  #             - if length is 1, don't run the loop and give warning
+  # tmpFile:    The temp file
+  # widths:     Passed to read.fwf function if not null. Otherwise, defined in function
+  # col.names:  Passed to read.fwf function if not null. Otherwise, defined in function
+  # col.class:  Passed to read.fwf function if not null. Otherwise, defined in function
+  tictoc::tic("full script") # timer for full script
+  
+  # if not explicitly passed, define these in the script
+  if(is.null(widths))     widths    <- c(5,2,2,5,2,1,2,2,14,13,13,14,13,14,13,1,2,3)
+  if(is.null(col.class))  col.class <- c("character", "character", "character", "numeric", "character", "character", 
+                                         "numeric", "character", "numeric", "numeric", "numeric", "numeric", "numeric", 
+                                         "numeric", "numeric", "character", "numeric", "character")
+  if(is.null(col.names))  col.names <- c("HCPCS_CD", "HCPCS_INITIAL_MODIFIER_CD", "PROVIDER_SPEC_CD", "CARRIER_NUM", 
+                                         "PRICING_LOCALITY_CD", "TYPE_OF_SERVICE_CD", "PLACE_OF_SERVICE_CD", 
+                                         "HCPCS_SECOND_MODIFIER_CD", "PSPS_SUBMITTED_SERVICE_CNT","PSPS_SUBMITTED_CHARGE_AMT",
+                                         "PSPS_ALLOWED_CHARGE_AMT", "PSPS_DENIED_SERVICES_CNT", "PSPS_DENIED_CHARGE_AMT", 
+                                         "PSPS_ASSIGNED_SERVICES_CNT", "PSPS_NCH_PAYMENT_AMT", "PSPS_HCPCS_ASC_IND_CD", 
+                                         "PSPS_ERROR_IND_CD", "HCPCS_BETOS_CD")
+  
+  
+  
+  
+  # call & read the first file
+  tictoc::tic("first file")
+  result_df <- read.fwf(unz(tmpFile, file_names[1]), 
+                        widths = widths, col.names = col.names, colClasses=col.class,
+                        buffersize = 90000,
+                        stringsAsFactors=F)
+  tictoc::toc()
+  
+  if(length(file_names) > 1) {
+    # for remaining files, read them and bind to result_df
+    for(i in file_names[-1]){
+      tictoc::tic(i)
+      result <- read.fwf(unz(tmpFile, i),
+                         widths = widths, col.names = col.names, colClasses=col.class,
+                         buffersize = 90000,
+                         stringsAsFactors=F)
+      result_df <- bind_rows(result_df, result)
+      tictoc::toc()
+    }
+  }
+  
+  
+  tictoc::toc()
+  return(result_df)
+}
+```
+
+## Parallel on server
+
+Running it in parallel makes it much quicker. It cuts down our runtime from ~20-25 minutes to ~10-15 minutes when all 4 cores are used. I bet if you added more vCPUs (this is being run on a VM instance in Google Cloud Compute Engine, so CPUs can be added easily) that'd cut down on the time even more.
+
+
+Now it should be noted that the timer function for each file isn't accurate for each file. For example, when the 2010 data is called in parallel it actually takes 15 minutes to get all 25 files. However, if you take the sum of the individual calls they add up to over 40 minutes.
+
+## Create the files
+
+
+```{r get18, eval=F}
+year <- "2018"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+
+# Find the name of the file
+zip::zip_list(temp)
+file_name <- "PSPS2018.csv"
+
+
+# Load as dataset
+file_uz <- unz(temp, file_name)
+data <- readr::read_csv(file_uz)
+
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, url, file_name, file_uz, temp)
+rm(data)
+```
+
+```{r get17, eval=F}
+year <- "2017"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+
+# Find the name of the file
+zip::zip_list(temp)
+file_name <- "PSPS_2017.csv"
+
+
+# Load as dataset
+file_uz <- unz(temp, file_name)
+data <- readr::read_csv(file_uz)
+
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, url, file_name, file_uz, temp)
+rm(data)
+```
+
+In **2016**, the data structure changes. This takes a little over 24 minutes to run using normal R code, but only 12 minutes in parallel
+
+```{r get16, eval=F}
+year <- "2016"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+
+# Find the name of the file
+zip::zip_list(temp)
+
+# make a list of these text files
+fileNames <- zip::zip_list(temp) %>%
+  filter(str_detect(filename, "txt|TXT")) %>%
+  .$filename
+
+
+
+
+# Using parallel
+tic("Parallel")
+plan(multisession)
+df <- future_map(fileNames, ~read_fixed(.x, temp))
+toc()
+# no errors!
+
+# Bind corrected list of df's together
+data <- bind_rows(df) %>% as_tibble()
+
+
+
+
+# Save full dataset (since it takes so long)
+data %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}_FULL.csv"))
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, url, temp, fileNames)
+rm(data, df)
+```
+
+**2015**'s files have errors for 21 & 23. The 21st file has an unknown multibyte, whereas the 23rd has an error seen in many of the years before, where the 18th column is shorter than expected. I've fixed both in the code below
+
+```{r get15, eval=F}
+year <- "2015"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+
+# Find the name of the file
+zip::zip_list(temp)
+
+# make a list of these text files
+fileNames <- zip::zip_list(temp) %>%
+  filter(str_detect(filename, "txt|TXT")) %>%
+  .$filename
+
+
+
+# Using parallel
+tic("Parallel")
+plan(multisession)
+df <- future_map(fileNames, ~read_fixed(.x, temp))
+toc()
+
+## error for file 21: invalid multibyte string at row number 475130, 
+## which starts with:
+#    97012G�350530201111 
+zip::unzip(temp, fileNames[21], exdir = "psps-data/problem_files/")
+x <- read_fixed(glue("psps-data/problem_files/{fileNames[21]}"), readr = TRUE)
+df[[21]] <- x
+
+## error for file 23: line 403316 did not have 18 elements
+zip::unzip(temp, fileNames[23], exdir = "psps-data/problem_files/")
+x <- read_fixed(glue("psps-data/problem_files/{fileNames[23]}"), readr = TRUE)
+df[[23]] <- x
+
+# Bind corrected list of df's together
+data <- bind_rows(df) %>% as_tibble()
+
+
+
+
+
+# Save full dataset (since it takes so long)
+data %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}_FULL.csv"))
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, url, file_name, file_uz, temp, fileNames)
+rm(data)
+```
+
+**2014**'s file number 21 gives an error, but I've corrected it
+
+```{r get14, eval=F}
+year <- "2014"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+rm(url)
+
+# Find the name of the file
+zip::zip_list(temp)
+
+# make a list of these text files
+fileNames <- zip::zip_list(temp) %>%
+  filter(str_detect(filename, "txt")) %>%
+  .$filename
+
+
+# Using parallel
+tic("Parallel")
+plan(multisession)
+df <- future_map(fileNames, ~read_fixed(.x, temp))
+toc()
+
+## error for file 21: line 201797 did not have 18 elements
+zip::unzip(temp, fileNames[21], exdir = "psps-data/problem_files/")
+x <- read_fixed("psps-data/problem_files/PSPS21.txt", readr = TRUE)
+df[[21]] <- x
+
+# Bind corrected list of df's together
+data <- bind_rows(df) %>% as_tibble()
+
+
+
+
+
+
+
+
+# Save full dataset (since it takes so long)
+data %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}_FULL.csv"))
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, temp, fileNames, x)
+rm(data, df)
+```
+
+**2013**'s files number 24 & 25 gives error, but I've corrected it
+
+```{r get13, eval=F}
+year <- "2013"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+
+# Find the name of the file
+zip::zip_list(temp)
+
+# make a list of these text files
+fileNames <- zip::zip_list(temp) %>%
+  filter(str_detect(filename, "txt|TXT")) %>%
+  .$filename
+
+
+# Using parallel
+tic("Parallel")
+plan(multisession)
+df <- future_map(fileNames, ~read_fixed(.x, temp))
+toc()
+
+df[[24]] ## error for file 24: line 140811 did not have 18 elements
+df[[25]] ## error for file 25: line 1266 did not have 18 elements
+zip::unzip(temp, fileNames[24], exdir = "psps-data/problem_files/")
+x <- read_fixed(glue("psps-data/problem_files/{fileNames[24]}"), readr = TRUE)
+df[[24]] <- x
+zip::unzip(temp, fileNames[25], exdir = "psps-data/problem_files/")
+x <- read_fixed(glue("psps-data/problem_files/{fileNames[25]}"), readr = TRUE)
+df[[25]] <- x
+
+# Bind corrected list of df's together
+data <- bind_rows(df) %>% as_tibble()
+
+
+# Save full dataset (since it takes so long)
+data %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}_FULL.csv"))
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, url, temp, fileNames, x)
+rm(data, df)
+```
+
+**2012** has no errors
+
+```{r get12, eval=F}
+year <- "2012"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+rm(url)
+
+# Find the name of the file
+zip::zip_list(temp)
+
+# make a list of these text files
+fileNames <- zip::zip_list(temp) %>%
+  filter(str_detect(filename, "XTR.PBAR")) %>%
+  .$filename
+
+
+# Using parallel
+tic("Parallel")
+plan(multisession)
+df <- future_map(fileNames, ~read_fixed(.x, temp))
+toc()
+# no errors!
+
+# Bind corrected list of df's together
+data <- bind_rows(df) %>% as_tibble()
+
+
+
+# Save full dataset (since it takes so long)
+data %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}_FULL.csv"))
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, temp, fileNames)
+rm(data)
+```
+
+**2011**'s file number 24 gives an error, but I've corrected it
+
+```{r get11, eval=F}
+year <- "2011"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+rm(url)
+
+# Find the name of the file
+zip::zip_list(temp)
+
+# make a list of these text files
+fileNames <- zip::zip_list(temp) %>%
+  filter(str_detect(filename, "#091112")) %>%
+  .$filename
+
+
+# Using parallel
+tic("Parallel")
+plan(multisession)
+df <- future_map(fileNames, ~read_fixed(.x, temp))
+toc()
+
+## error for file 24: line 201797 did not have 18 elements
+zip::unzip(temp, fileNames[24], exdir = "psps-data/problem_files/")
+x <- read_fixed(glue("psps-data/problem_files/{fileNames[24]}"), readr = TRUE)
+df[[24]] <- x
+
+# Bind corrected list of df's together
+data <- bind_rows(df) %>% as_tibble()
+
+
+
+# Save full dataset (since it takes so long)
+data %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}_FULL.csv"))
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, temp, fileNames, x)
+rm(data, df)
+```
+
+**2010** has no errors
+
+```{r get10, eval=F}
+year <- "2010"
+url <- filter(urls_df, years==year)$url
+temp <- tempfile()
+download.file(url, temp) # download to temp
+rm(url)
+
+# Find the name of the file
+zip::zip_list(temp)
+
+# make a list of these text files
+fileNames <- zip::zip_list(temp) %>%
+  filter(str_detect(filename, "BGASOO1")) %>%
+  .$filename
+
+
+# Using parallel
+tic("Parallel")
+plan(multisession)
+df <- future_map(fileNames, ~read_fixed(.x, temp))
+toc()
+
+data <- bind_rows(df) %>% as_tibble()
+
+
+# Save full dataset (since it takes so long)
+data %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}_FULL.csv"))
+
+# write to csv
+data %>% 
+  filter(PROVIDER_SPEC_CD %in% c("14", "13", "77", "94")) %>%
+  mutate(Specialty = case_when(PROVIDER_SPEC_CD=="14" ~ "Neurosurgery",
+                               PROVIDER_SPEC_CD=="13" ~ "Neurology",
+                               PROVIDER_SPEC_CD=="77" ~ "Vascular",
+                               PROVIDER_SPEC_CD=="94" ~ "IR")) %>%
+  mutate(data_year = year) %>%
+  write_csv(glue("psps-data/psps_{year}.csv"))
+
+
+# clean up
+unlink(temp)
+rm(year, temp, fileNames)
+rm(data, df)
+```
+
+## Merge the data
+
+
+```{r make_merged, eval=F}
+df <- 2010:2018 %>%
+  # Make file names/paths
+  map(~str_c("psps-data/psps_", .x, ".csv")) %>%
+  # read CSVs
+  map(~read_csv(.x, col_types="cccdccdcdddddddcdccd")) %>%
+  # bind together
+  bind_rows() %>% as_tibble()
+
+df %>% write_csv("psps-data/merged.csv")
+```
+
+# Explore the data
+
+
+
+
+
+```{r}
+procedure_codes <- c(61623, 61645, 37215, 61650, 61651)
+
+procedure_codes <- c(61624, 75894)
+procedure_codes <- c(61623, 61624, 61710)
+procedure_codes <- c(61630, 61635)
+
+df %>%
+  
+  # filter(str_detect(CPT, "61624")) %>%
+  filter(CPT %in% procedure_codes) %>%
+  group_by(CPT, description, data_year, Specialty) %>%
+  summarise(num = sum(PSPS_SUBMITTED_SERVICE_CNT)) %>%
+  mutate(totalYr = sum(num)) %>%
+  # glimpse()
+  # View()
+  ggplot(aes(x=data_year, color=Specialty)) + 
+    # geom_line(aes(y=num)) +         # raw numbers
+    geom_line(aes(y=num/totalYr)) + # as percent
+    facet_wrap("CPT",scales = "free")
+```
+
+
