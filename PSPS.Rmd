@@ -80,7 +80,8 @@ library(gargle)
 options(gargle_oob_default = TRUE) # required on RStudio Server
 
 gs <- as_sheets_id("https://docs.google.com/spreadsheets/d/1IR2TCwYZ-BX3MaVfZVh8vA1DZGRu965MDxzNXB1avqc/") %>%
-  read_sheet("NeuroIR codes")
+  read_sheet("NeuroIR codes") %>%
+  mutate(CPT=as.numeric(CPT))
 ```
 
 ## Merged dataset
@@ -93,8 +94,9 @@ df <- read_csv("psps-data/merged.csv") %>%
   mutate(HCPCS_CD = as.numeric(HCPCS_CD)) %>%
   filter(!is.na(HCPCS_CD)) %>%
   rename(CPT=HCPCS_CD) %>%
+  mutate(Specialty = factor(Specialty)) %>%
   # Join to description of 2019 codes
-  left_join(CPT, by=c("CPT"="CODE"))
+  left_join(CPT, by=c("CPT"="CODE")) 
 ```
 
 
@@ -750,5 +752,115 @@ df %>%
     geom_line(aes(y=num/totalYr)) + # as percent
     facet_wrap("CPT",scales = "free")
 ```
+
+Here's a list of each CPT code in the google sheet, and the total number billed during 2018
+
+```{r}
+df %>%
+  filter(CPT %in% gs$CPT) %>%
+  filter(data_year==2018) %>%
+  group_by(CPT, description) %>%
+  summarise(num = sum(PSPS_SUBMITTED_SERVICE_CNT)) %>%
+  filter(num>200)
+```
+
+
+
+
+```{r}
+procedure_codes <- gs$CPT[1:5]
+procedure_codes <- gs$CPT[6:10]
+procedure_codes <- gs$CPT[11:17]
+procedure_codes <- gs$CPT[18:25]
+procedure_codes <- gs$CPT[26:35]
+procedure_codes <- c(61705:61710)
+
+df %>%
+  
+  # filter(str_detect(CPT, "37242")) %>%
+  filter(CPT %in% procedure_codes) %>%
+  # filter(CPT %in% c(36221:36228)) %>%
+  
+  mutate(description = case_when(CPT==61705 ~ "by intracranial and cervical occlusion of carotid artery",
+                                 CPT==61708 ~ "by intracranial electrothrombosis",
+                                 CPT==61710 ~ "by intra-arterial embolization, injection, or balloon",
+                                 TRUE ~ as.character(CPT))) %>%
+  mutate(description = str_glue("{CPT}\n{str_wrap(description,30)}")) %>%
+           
+           
+  group_by(CPT, description, data_year, Specialty) %>%
+  summarise(num = sum(PSPS_SUBMITTED_SERVICE_CNT)) %>%
+  mutate(totalYr = sum(num)) %>%
+  # glimpse()
+  # View()
+  ggplot(aes(x=data_year, color=Specialty)) + 
+    geom_line(aes(y=num)) +         # raw numbers
+    # geom_line(aes(y=num/totalYr)) + # as percent
+    facet_wrap("description",scales = "free")
+
+
+```
+
+
+Make a list of CPTs that both NSG and IR have billed for at least 250 times (each) over this period
+
+```{r}
+NSG <- df %>% 
+  filter(Specialty=="Neurosurgery") %>% 
+  group_by(CPT, description) %>%
+  summarise(num = sum(PSPS_SUBMITTED_SERVICE_CNT)) %>%
+  filter(num>250) %>%
+  rename(NSG=num)
+
+IR <- df %>% 
+  filter(Specialty=="IR") %>% 
+  group_by(CPT, description) %>%
+  summarise(num = sum(PSPS_SUBMITTED_SERVICE_CNT)) %>%
+  filter(num>250) %>%
+  rename(IR=num)
+
+shared_cpt <- df %>%
+  count(CPT) %>%
+  filter(CPT %in% IR$CPT) %>%
+  filter(CPT %in% NSG$CPT) %>%
+  .$CPT
+```
+
+```{r}
+df %>%
+  filter(CPT %in% shared_cpt) %>%
+  filter(Specialty %in% c("IR", "Neurosurgery")) %>%
+  group_by(CPT, description, data_year, Specialty) %>%
+  summarise(num = sum(PSPS_SUBMITTED_SERVICE_CNT)) %>%
+  mutate(totalYr = sum(num)) %>%
+  filter(Specialty=="IR") %>%
+  mutate(pct = num/totalYr) %>%
+  ungroup() %>%
+  ggplot(aes(x=data_year, y=pct, group=CPT, alpha=totalYr)) +
+  geom_line()
+  filter(data_year==2013|data_year==2018)
+```
+
+
+```{r}
+procedure_codes <- c(61623:61635, 61645)
+
+df %>%
+  inner_join(filter(gs, Include), by="CPT") %>%
+  mutate(CPT = case_when(CPT==61635 ~ 61630,
+                         TRUE       ~ CPT)) %>%
+  group_by(CPT, label, data_year, Specialty) %>%
+  summarise(num = sum(PSPS_SUBMITTED_SERVICE_CNT)) %>%
+  mutate(totalYr = sum(num)) %>%
+  # glimpse()
+  # View()
+  ggplot(aes(x=data_year, color=Specialty)) + 
+    # geom_line(aes(y=num)) +         # raw numbers
+    # geom_smooth(aes(y=num), se=F) +         # raw numbers
+    geom_line(aes(y=num/totalYr)) + labs(y="% of total") +# as percent
+    facet_wrap("CPT",scales = "free")
+```
+
+
 
 
