@@ -3,7 +3,8 @@
 .RData
 .Ruserdata
 *.Rproj
-
+.secrets
 # Ignore folders
 data
 psps-data
+shiny/PSPS_explorer/rsconnect
