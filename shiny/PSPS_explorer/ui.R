@@ -25,18 +25,18 @@ shinyUI(fluidPage(theme = shinytheme("united"),
     fluidRow(
        column(width=6,
               sliderInput("IR_th", "IR cutoff:", round=3,
-                          min = 0, max = 1000, width="100%",
+                          min = 0, max = 500, width="100%",
                           value = 15, step=5),
               sliderInput("NSG_th", "NSG cutoff:", round=3,
-                          min = 0, max = 1000, width="100%",
+                          min = 0, max = 500, width="100%",
                           value = 15, step=5)
        ),
        column(width=6,
               sliderInput("Vasc_th", "Vascular cutoff:", round=3,
-                          min = 0, max = 1000, width="100%",
+                          min = 0, max = 500, width="100%",
                           value = 0, step=5),
               sliderInput("Neuro_th", "Neurology cutoff:", round=3,
-                          min = 0, max = 1000, width="100%",
+                          min = 0, max = 500, width="100%",
                           value = 0, step=5)
        )
     ),
