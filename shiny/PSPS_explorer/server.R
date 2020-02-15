@@ -1,12 +1,3 @@
-#
-# This is the server logic of a Shiny web application. You can run the
-# application by clicking 'Run App' above.
-#
-# Find out more about building applications with Shiny here:
-#
-#    http://shiny.rstudio.com/
-#
-
 library(shiny)
 library(ggthemes)
 library(scales)
@@ -16,27 +7,74 @@ man_color <- scale_color_manual(values = c("IR"           = "#1B9E77",
                                            "Vascular"     = "#7570B3", 
                                            "Neurology"    = "#E7298A"))
 
-# Define server logic required to draw a histogram
+
 shinyServer(function(input, output) {
     
-    
-    
-    output$select_filtered_codes <- renderUI({
-        filt <- input$range_slider
+    ##################################
+    ##    Reactive: Filter codes    ##
+    ##################################
+    prefix_codes <- reactive({
+        ### If the user provides a prefix to filter
+        ### the CPT codes by, returns a filtered version
+        ### containing only codes matching that prefix
         
-        # only codes meeting the range given
-        codes <- tibble(codes_num = all_codes_num,
-                        codes_chr = all_codes) %>%
-            filter(codes_num >= filt[1],
-                   codes_num <= filt[2]) %>%
-            .$codes_chr
+        prefix <- str_c("^", input$starts_str, collapse = "")
+        
+        # only filter if value is given
+        if(length(prefix>1)) {
+            new_codes <- all_codes[str_which(all_codes, prefix)]
+        } else({new_codes <- all_codes})
+        
+        new_codes
+    })
+    
+    sliderFilteredCodes <- reactive({
+        ### After applying the prefix filter, this returns
+        ### another filter based on the slider values
+        codes <- prefix_codes()
+
+        ## get slider values
+        th_IR    <- input$IR_th
+        th_NSG   <- input$NSG_th
+        th_Vasc  <- input$Vasc_th
+        th_Neuro <- input$Neuro_th
+        
+        codes2 <- df_max %>%
+            filter(CPT %in% codes) %>%
+            filter(IR>=th_IR, Neurosurgery>=th_NSG,
+                   Vascular>=th_Vasc, Neurology>=th_Neuro) %>%
+            .$CPT
+        
+        # return value
+        codes2
+    })
+    
+    
+    ##########################
+    ##    Conditional UI    ##
+    ##########################
+    output$select_filtered_codes <- renderUI({
+        ### Generates a custom select UI that only
+        ### provides CPT codes conditional on the
+        ### filters applied in sections above
+        
+        codes <- sliderFilteredCodes()
+        label_text <- str_glue("CPT codes: ({length(codes)} codes meet criteria)")
         
         # Render the select list with filtered codes
-        selectInput("cpt_codes", "CPT codes", multiple = T, selected = "61624",
+        selectInput("cpt_codes", label = label_text, 
+                    multiple = T, selected = "61624",
                     choices=c(codes,"61624"))
     })
     
+    
+    #################################
+    ##    Reactive: data filter    ##
+    #################################
     get_data <- reactive({
+        ### Filters data frame to only include the
+        ### user's selected CPT code(s)
+        
         data %>%
             filter(CPT %in% input$cpt_codes) %>%
             group_by(CPT, data_year) %>%
